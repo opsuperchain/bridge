@@ -43,7 +43,7 @@ Remote Chain (spoke)              OP Mainnet (hub)
 ### Design Principles
 
 - **Permissionless** — anyone can wrap any ERC20 on any chain. No whitelists, no governance.
-- **Pluggable trust** — choose your bridge provider. Each adapter is a separate trust domain. One wrapped token per (chain, token, adapter) tuple — isolated risk.
+- **Configurable trust model** — the bridge itself is trust-neutral. Your trust assumptions are determined entirely by which adapter you choose. Want Chainlink's oracle network? Use a CCIP adapter. Prefer LayerZero's DVN model? Use the LZ adapter. Want native OP Stack interop when it goes live? Write that adapter. Different adapters produce different wrapped tokens, so risk is isolated per adapter.
 - **Fully immutable** — no owner, no admin, no pause, no upgrades on any contract. All configuration is write-once.
 - **Deterministic** — Factory and Vault deploy to the same address on every chain via the [CREATE2 deployer](https://github.com/Arachnid/deterministic-deployment-proxy).
 - **Adapter-gated registration** — only the adapter contract itself can register vault/factory pairings, preventing front-running attacks.
@@ -139,14 +139,18 @@ ADAPTER_ADDRESS=0x...    # chain-specific
 
 ### Trust Model
 
+The bridge core (Factory, Vault, BridgeToken) is trust-neutral — it makes no assumptions about how messages get from chain A to chain B. All trust lives in the adapter layer.
+
 ```
-LZ Endpoint ──guarantees sender identity──▶ Adapter ──checks peer mapping──▶ Factory/Vault ──checks sender mapping──▶ Mint/Unlock
+Message Protocol ──guarantees delivery──▶ Adapter ──checks peer mapping──▶ Factory/Vault ──checks sender mapping──▶ Mint/Unlock
 ```
 
 Three layers of verification:
-1. **LayerZero DVNs** verify the message was actually sent on the source chain
+1. **Message protocol** (LZ, CCIP, native interop, etc.) guarantees the message was actually sent on the source chain
 2. **Adapter** checks the message came from its registered peer on the remote chain
 3. **Factory/Vault** checks the sender (decoded from the message) matches the registered counterpart
+
+Different adapters = different trust assumptions = different wrapped tokens. This is by design — if one adapter is compromised, only tokens bridged through that adapter are affected.
 
 ## Adapters
 
@@ -162,18 +166,25 @@ interface IBridgeAdapter {
 }
 ```
 
-### LayerZero v2 Adapter
+### Included: LayerZero v2 Adapter
 
-The included `LzBridgeAdapter` wraps LayerZero v2's endpoint directly (no OApp inheritance). It:
-- Translates between EVM chain IDs and LZ endpoint IDs
-- Wraps/unwraps message payloads with sender and receiver info
-- Validates peers on both sides
-- Is fully immutable — all config (peers, chain mappings) is write-once
+We built a LayerZero v2 adapter (`LzBridgeAdapter`) as the first implementation. It wraps LZ's endpoint directly (no OApp inheritance), is fully immutable, and costs ~$0.01-0.10 per L2-to-L2 message.
 
-### Adding New Adapters
+### Future Adapters
 
-Implement `IBridgeAdapter` and `IBridgeMessageReceiver` for your protocol. The adapter must:
-1. Forward `sendMessage()` calls to the bridge protocol
+The interface is simple enough to implement for any cross-chain messaging protocol:
+
+- **Chainlink CCIP** — Chainlink's DON-backed messaging
+- **Hyperlane** — permissionless, customizable security modules
+- **OP Stack native interop** — `L2ToL2CrossDomainMessenger` (when it goes live on mainnet)
+- **Wormhole**, **Axelar**, or any other protocol
+
+Each adapter is independent. You can run multiple adapters in parallel — users choose which one to bridge through based on their trust preferences.
+
+### Writing Your Own Adapter
+
+Implement `IBridgeAdapter` for your protocol. The adapter must:
+1. Forward `sendMessage()` calls to the messaging protocol
 2. On the destination, call `IBridgeMessageReceiver(receiver).onBridgeMessage(srcChainId, srcSender, payload)`
 3. Authenticate that messages actually came from the source chain (protocol-specific)
 
