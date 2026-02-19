@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env if it exists
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+# --- Constants ---
+
+# Vault and Factory have the same deterministic address on all chains
+# (deployed via CREATE2 deployer at 0x4e59b44847b379578588920cA78FbF26c0B4956C with salt=0)
+# These get set after first deploy — run `./bridge predict` to compute them.
+FACTORY_ADDRESS="${FACTORY_ADDRESS:-}"
+VAULT_ADDRESS="${VAULT_ADDRESS:-}"
+
+# --- Helpers ---
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+require_var() {
+    for var in "$@"; do
+        [[ -n "${!var:-}" ]] || die "$var is not set. Check your .env file."
+    done
+}
+
+get_rpc() {
+    local chain="$1"
+    case "$chain" in
+        optimism|op|10)   echo "${OP_RPC:?OP_RPC not set}" ;;
+        base|8453)        echo "${BASE_RPC:?BASE_RPC not set}" ;;
+        *)                die "Unknown chain: $chain" ;;
+    esac
+}
+
+get_chain_id() {
+    local chain="$1"
+    case "$chain" in
+        optimism|op|10)   echo 10 ;;
+        base|8453)        echo 8453 ;;
+        *)                die "Unknown chain: $chain" ;;
+    esac
+}
+
+usage() {
+    cat <<'EOF'
+Usage: ./bridge <command> [options]
+
+Setup:
+  predict                                              Show deterministic contract addresses
+  deploy          --chain <chain>                      Deploy all contracts on a chain
+  register        --adapter <addr> --remote-chain <c>  Register vault<->factory pairing
+
+Bridge:
+  wrap            --token <addr> --amount <amt> --chain <chain> [--recipient <addr>]
+  unwrap          --token <addr> --amount <amt> --chain <chain> [--recipient <addr>]
+
+Info:
+  address         --token <addr> --chain <id> --adapter <addr>
+  balance         --token <addr> [--chain <chain>]
+  status
+
+Chains: base (8453), optimism (10)
+EOF
+    exit 0
+}
+
+# --- Commands ---
+
+cmd_predict() {
+    echo "Computing deterministic addresses..."
+    forge script "$SCRIPT_DIR/script/Deploy.s.sol:Deploy" --sig "predict()" 2>&1 | grep -E "(Factory|Vault):"
+}
+
+cmd_deploy() {
+    local chain=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chain) chain="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$chain" ]] || die "--chain required"
+    require_var PRIVATE_KEY
+
+    local rpc
+    rpc=$(get_rpc "$chain")
+
+    echo "Deploying contracts on $chain..."
+    forge script "$SCRIPT_DIR/script/DeployAndRegister.s.sol:DeployAndRegister" \
+        --rpc-url "$rpc" \
+        --private-key "$PRIVATE_KEY" \
+        --broadcast
+}
+
+cmd_register() {
+    local adapter="" remote_chain=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --adapter)       adapter="$2"; shift 2 ;;
+            --remote-chain)  remote_chain="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$adapter" ]]      || die "--adapter required"
+    [[ -n "$remote_chain" ]] || die "--remote-chain required"
+    require_var PRIVATE_KEY FACTORY_ADDRESS VAULT_ADDRESS
+
+    local remote_chain_id remote_rpc
+    remote_chain_id=$(get_chain_id "$remote_chain")
+    remote_rpc=$(get_rpc "$remote_chain")
+    local op_rpc
+    op_rpc=$(get_rpc "op")
+
+    echo "Registering adapter $adapter for chain $remote_chain_id..."
+
+    # On factory (OP Mainnet): trust vault on remote chain
+    echo "  registerVault on factory..."
+    cast send "$FACTORY_ADDRESS" \
+        "registerVault(address,uint256,address)" \
+        "$adapter" "$remote_chain_id" "$VAULT_ADDRESS" \
+        --rpc-url "$op_rpc" \
+        --private-key "$PRIVATE_KEY"
+
+    # On vault (remote chain): trust factory on OP Mainnet
+    echo "  registerFactory on vault..."
+    cast send "$VAULT_ADDRESS" \
+        "registerFactory(address,uint256,address)" \
+        "$adapter" 10 "$FACTORY_ADDRESS" \
+        --rpc-url "$remote_rpc" \
+        --private-key "$PRIVATE_KEY"
+
+    echo "Registration complete."
+}
+
+cmd_wrap() {
+    local token="" amount="" chain="" recipient=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token)     token="$2"; shift 2 ;;
+            --amount)    amount="$2"; shift 2 ;;
+            --chain)     chain="$2"; shift 2 ;;
+            --recipient) recipient="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$token" ]]  || die "--token required"
+    [[ -n "$amount" ]] || die "--amount required"
+    [[ -n "$chain" ]]  || die "--chain required"
+    require_var PRIVATE_KEY VAULT_ADDRESS FACTORY_ADDRESS ADAPTER_ADDRESS
+
+    local rpc chain_id
+    rpc=$(get_rpc "$chain")
+    chain_id=$(get_chain_id "$chain")
+
+    if [[ -z "$recipient" ]]; then
+        recipient=$(cast wallet address --private-key "$PRIVATE_KEY")
+    fi
+
+    local amount_wei
+    amount_wei=$(cast to-wei "$amount")
+
+    local symbol
+    symbol=$(cast call "$token" "symbol()(string)" --rpc-url "$rpc" 2>/dev/null || echo "???")
+    echo "Bridging $amount $symbol from $chain -> OP Mainnet..."
+
+    # Approve
+    echo "  Approving..."
+    cast send "$token" \
+        "approve(address,uint256)" \
+        "$VAULT_ADDRESS" "$amount_wei" \
+        --rpc-url "$rpc" \
+        --private-key "$PRIVATE_KEY"
+
+    # Bridge
+    echo "  Locking in vault..."
+    cast send "$VAULT_ADDRESS" \
+        "bridge(address,uint256,address,uint256,address)" \
+        "$token" "$amount_wei" "$ADAPTER_ADDRESS" 10 "$recipient" \
+        --rpc-url "$rpc" \
+        --private-key "$PRIVATE_KEY"
+
+    # Show predicted wrapped token address
+    local op_rpc
+    op_rpc=$(get_rpc "op")
+    local predicted
+    predicted=$(cast call "$FACTORY_ADDRESS" \
+        "computeAddress(uint256,address,address)(address)" \
+        "$chain_id" "$token" "$ADAPTER_ADDRESS" \
+        --rpc-url "$op_rpc")
+    echo "  Wrapped token on OP Mainnet: $predicted"
+    echo "Done. Wait for LayerZero to deliver the message."
+}
+
+cmd_unwrap() {
+    local token="" amount="" chain="" recipient=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token)     token="$2"; shift 2 ;;
+            --amount)    amount="$2"; shift 2 ;;
+            --chain)     chain="$2"; shift 2 ;;
+            --recipient) recipient="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$token" ]]  || die "--token required"
+    [[ -n "$amount" ]] || die "--amount required"
+    require_var PRIVATE_KEY FACTORY_ADDRESS
+
+    local op_rpc
+    op_rpc=$(get_rpc "op")
+
+    if [[ -z "$recipient" ]]; then
+        recipient=$(cast wallet address --private-key "$PRIVATE_KEY")
+    fi
+
+    local amount_wei
+    amount_wei=$(cast to-wei "$amount")
+
+    local symbol
+    symbol=$(cast call "$token" "symbol()(string)" --rpc-url "$op_rpc" 2>/dev/null || echo "???")
+    echo "Bridging $amount $symbol back..."
+
+    cast send "$FACTORY_ADDRESS" \
+        "bridgeBack(address,uint256,address)" \
+        "$token" "$amount_wei" "$recipient" \
+        --rpc-url "$op_rpc" \
+        --private-key "$PRIVATE_KEY"
+
+    echo "Done. Wait for LayerZero to deliver the message."
+}
+
+cmd_address() {
+    local token="" chain="" adapter=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token)   token="$2"; shift 2 ;;
+            --chain)   chain="$2"; shift 2 ;;
+            --adapter) adapter="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$token" ]]   || die "--token required"
+    [[ -n "$chain" ]]   || die "--chain required"
+    [[ -n "$adapter" ]] || die "--adapter required"
+    require_var FACTORY_ADDRESS
+
+    local op_rpc
+    op_rpc=$(get_rpc "op")
+
+    cast call "$FACTORY_ADDRESS" \
+        "computeAddress(uint256,address,address)(address)" \
+        "$chain" "$token" "$adapter" \
+        --rpc-url "$op_rpc"
+}
+
+cmd_balance() {
+    local token="" chain="op"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token) token="$2"; shift 2 ;;
+            --chain) chain="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n "$token" ]] || die "--token required"
+    require_var PRIVATE_KEY
+
+    local rpc
+    rpc=$(get_rpc "$chain")
+    local addr
+    addr=$(cast wallet address --private-key "$PRIVATE_KEY")
+
+    local balance decimals symbol
+    balance=$(cast call "$token" "balanceOf(address)(uint256)" "$addr" --rpc-url "$rpc")
+    symbol=$(cast call "$token" "symbol()(string)" --rpc-url "$rpc" 2>/dev/null || echo "???")
+
+    echo "$balance $symbol (raw)"
+    echo "$(cast from-wei "$balance") $symbol"
+}
+
+cmd_status() {
+    require_var FACTORY_ADDRESS VAULT_ADDRESS
+    echo "Factory: $FACTORY_ADDRESS (same on all chains)"
+    echo "Vault:   $VAULT_ADDRESS (same on all chains)"
+    [[ -n "${ADAPTER_ADDRESS:-}" ]] && echo "Adapter: $ADAPTER_ADDRESS"
+    [[ -n "${OP_RPC:-}" ]]          && echo "OP RPC:  $OP_RPC"
+    [[ -n "${BASE_RPC:-}" ]]        && echo "Base RPC: $BASE_RPC"
+}
+
+# --- Main ---
+
+[[ $# -gt 0 ]] || usage
+
+cmd="$1"; shift
+case "$cmd" in
+    predict)   cmd_predict ;;
+    deploy)    cmd_deploy "$@" ;;
+    register)  cmd_register "$@" ;;
+    wrap)      cmd_wrap "$@" ;;
+    unwrap)    cmd_unwrap "$@" ;;
+    address)   cmd_address "$@" ;;
+    balance)   cmd_balance "$@" ;;
+    status)    cmd_status ;;
+    help|-h|--help) usage ;;
+    *)         die "Unknown command: $cmd. Run './bridge help' for usage." ;;
+esac

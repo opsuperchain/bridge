@@ -1,0 +1,15 @@
+# Compiler files
+cache/
+out/
+
+# Broadcast logs (contain RPC URLs)
+broadcast/
+
+# Docs
+docs/
+
+# Dotenv file
+.env
+
+# OS
+.DS_Store
